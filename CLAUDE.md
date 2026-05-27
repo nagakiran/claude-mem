@@ -1,115 +1,120 @@
-# Claude-Mem: AI Development Instructions
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 Claude-mem is a Claude Code plugin providing persistent memory across sessions. It captures tool usage, compresses observations using the Claude Agent SDK, and injects relevant context into future sessions.
+
+## Build & Development Commands
+
+```bash
+npm run build-and-sync        # Build, sync to marketplace, restart worker (primary dev command)
+npm run build                 # Build only (no sync/restart)
+npm run typecheck             # Type-check all source including viewer
+npm run typecheck:root        # Type-check src/ only (excludes viewer)
+npm test                      # Run all tests via bun test
+npm run test:sqlite           # Run SQLite tests only
+npm run test:agents           # Run agent tests only
+npm run test:search           # Run search tests only
+npm run test:context          # Run context tests only
+npm run test:server           # Run server tests only
+npm run worker:start          # Start the worker daemon
+npm run worker:restart        # Restart the worker daemon
+npm run worker:status         # Check worker status
+npm run worker:logs           # View today's worker logs
+npm run worker:tail           # Tail worker logs live
+npm run strip-comments:check  # Check for comments that should be stripped
+```
 
 ## Architecture
 
 **6 Lifecycle Hooks**: Setup → SessionStart → UserPromptSubmit → PreToolUse (Read) → PostToolUse → Stop
 
-**Hooks** - Entries in `plugin/hooks/hooks.json` dispatch to the unified worker (`plugin/scripts/worker-service.cjs`, built from `src/services/worker-service.ts` via `scripts/build-hooks.js`) through `bun-runner.js`, invoking subcommands like `context`, `session-init`, `observation`, `file-context`, and `summarize`. The Setup-phase `version-check.js` is the only standalone hook script.
+Each hook dispatches to the unified worker via `bun-runner.js` → `plugin/scripts/worker-service.cjs` (bundled CJS, built from `src/services/worker-service.ts` via `scripts/build-hooks.js`). Hook subcommands: `context`, `session-init`, `observation`, `file-context`, `summarize`. The Setup-phase `version-check.js` is the only standalone hook script.
 
-**Worker Service** (`src/services/worker-service.ts`) - Express API on the per-user worker port (default `37700 + (uid % 100)`, configurable via `CLAUDE_MEM_WORKER_PORT`), Bun-managed, handles AI processing asynchronously
+**Worker Service** (`src/services/worker-service.ts`) — Express HTTP server on per-user port (`37700 + (uid % 100)`, override with `CLAUDE_MEM_WORKER_PORT`). Managed by Bun as a daemon. Handles all AI processing asynchronously.
 
-**Database** (`src/services/sqlite/`) - SQLite3 at `~/.claude-mem/claude-mem.db`
+**Worker HTTP API** (`src/services/worker/http/routes/`) — Route handlers organized by feature:
+- `SessionRoutes.ts` — Session lifecycle (init, observations, summarize, complete)
+- `DataRoutes.ts` — Data retrieval (observations, summaries, prompts, stats, projects)
+- `SearchRoutes.ts` — Search/MCP proxy (unified search, timeline, decisions, changes)
+- `SettingsRoutes.ts` — Settings CRUD, MCP toggle, branch switching
+- `ViewerRoutes.ts` — Health check (`GET /health`), viewer UI, SSE stream (`GET /stream`)
 
-**Search Skill** (`plugin/skills/mem-search/SKILL.md`) - HTTP API for searching past work, auto-invoked when users ask about history
+**AI Providers** (`src/services/worker/`) — `ClaudeProvider.ts`, `GeminiProvider.ts`, `OpenRouterProvider.ts`. Selected via `CLAUDE_MEM_PROVIDER` setting. Tier routing splits simple vs. summary tasks to different models.
 
-**Planning Skill** (`plugin/skills/make-plan/SKILL.md`) - Orchestrator instructions for creating phased implementation plans with documentation discovery
+**Database** (`src/services/sqlite/`) — SQLite3 at `~/.claude-mem/claude-mem.db`. Tables: sessions, observations, summaries, prompts, timeline.
 
-**Execution Skill** (`plugin/skills/do/SKILL.md`) - Orchestrator instructions for executing phased plans using subagents
+**Chroma** (`src/services/sync/ChromaSync.ts`) — Optional vector embeddings for semantic search, managed via `ChromaMcpManager.ts`.
 
-**Chroma** (`src/services/sync/ChromaSync.ts`) - Vector embeddings for semantic search
+**MCP Server** (`src/servers/mcp-server.ts`) — Exposes search tools via MCP protocol; worker proxies search requests to it.
 
-**Viewer UI** (`src/ui/viewer/`) - React interface served by the worker on its configured port (default `http://127.0.0.1:<worker-port>`), built to `plugin/ui/viewer.html`
+**Server Beta** (`src/server/`) — Optional server-mode variant with BetterAuth API keys, BullMQ queue, PostgreSQL support, and additional routes in `src/server/routes/v1/`.
+
+**Viewer UI** (`src/ui/viewer/`) — React 19 interface built to `plugin/ui/viewer.html`, served by the worker.
+
+**Skills** (`plugin/skills/`) — Markdown-driven orchestrator instructions for user-invocable slash commands: `mem-search`, `make-plan`, `do`, `learn-codebase`, `knowledge-agent`, `timeline-report`, etc.
+
+## Build Pipeline
+
+`scripts/build-hooks.js` uses esbuild to bundle four entry points into `plugin/scripts/`:
+- `worker-service.cjs` (from `src/services/worker-service.ts`)
+- `mcp-server.cjs` (from `src/servers/mcp-server.ts`)
+- `context-generator.cjs` (from `src/services/context-generator.ts`)
+- `server-beta-service.cjs` (from `src/server/runtime/ServerBetaService.ts`)
+
+`scripts/sync-plugin-manifests.js` copies version and metadata into nested `package.json` files before the esbuild step. `scripts/sync-marketplace.cjs` copies the built plugin to `~/.claude/plugins/marketplaces/thedotmack/`.
 
 ## Privacy Tags
-- `<private>content</private>` - User-level privacy control (manual, prevents storage)
-
-**Implementation**: Tag stripping happens at hook layer (edge processing) before data reaches worker/database. See `src/utils/tag-stripping.ts` for shared utilities.
-
-## Build Commands
-
-```bash
-npm run build-and-sync        # Build, sync to marketplace, restart worker
-```
-
-## Configuration
-
-Settings are managed in `~/.claude-mem/settings.json`. The file is auto-created with defaults on first run.
-
-## Multi-account
-
-Claude-mem supports running multiple isolated profiles on the same machine (e.g. work vs personal accounts) via environment variables. No CLI subcommand needed — set the env vars in the shell where you run Claude Code.
-
-- **Switch profiles per shell:** Set `CLAUDE_MEM_DATA_DIR=<path>` and every claude-mem path (database, chroma, logs, settings.json, worker.pid, transcripts config) derives from it. Example:
-
-  ```bash
-  export CLAUDE_MEM_DATA_DIR="$HOME/.claude-mem-work"
-  ```
-
-- **Port collisions are auto-handled:** The default worker port is `37700 + (uid % 100)`, so two different OS users on the same box get different ports for free. If you want fixed ports per profile (e.g. you run two profiles as the same UID), set `CLAUDE_MEM_WORKER_PORT` too:
-
-  ```bash
-  export CLAUDE_MEM_WORKER_PORT=37800
-  ```
-
-- **All paths and ports derive from these two env vars.** Hooks, npx-cli (`install`/`uninstall`/`start`/`search`), the OpenCode plugin, the OpenClaw installer, and the timeline-report skill all honor them. The settings file itself lives at `$CLAUDE_MEM_DATA_DIR/settings.json`.
-
-- See `src/shared/SettingsDefaultsManager.ts` for the canonical port/data-dir defaults and `plugin/skills/timeline-report/SKILL.md` for the shell snippet that resolves the port for arbitrary skills.
-
-## File Locations
-
-- **Source**: `<project-root>/src/`
-- **Built Plugin**: `<project-root>/plugin/`
-- **Installed Plugin**: `~/.claude/plugins/marketplaces/thedotmack/`
-- **Database**: `~/.claude-mem/claude-mem.db`
-- **Chroma**: `~/.claude-mem/chroma/`
+`<private>content</private>` — prevents storage. Stripping happens at hook layer before data reaches the worker. See `src/utils/tag-stripping.ts`.
 
 ## Exit Code Strategy
 
-Claude-mem hooks use specific exit codes per Claude Code's hook contract:
-
-- **Exit 0**: Success or graceful shutdown (Windows Terminal closes tabs)
+- **Exit 0**: Success (also used for worker errors to prevent Windows Terminal tab accumulation)
 - **Exit 1**: Non-blocking error (stderr shown to user, continues)
 - **Exit 2**: Blocking error (stderr fed to Claude for processing)
 
-**Philosophy**: Worker/hook errors exit with code 0 to prevent Windows Terminal tab accumulation. The wrapper/plugin layer handles restart logic. ERROR-level logging is maintained for diagnostics.
+## Configuration
+
+Settings at `~/.claude-mem/settings.json` (auto-created). Key env vars controlling all paths and ports:
+- `CLAUDE_MEM_DATA_DIR` — override data directory (default `~/.claude-mem`)
+- `CLAUDE_MEM_WORKER_PORT` — override worker port (default `37700 + (uid % 100)`)
+
+See `src/shared/SettingsDefaultsManager.ts` for the full list of configurable keys.
+
+## Multi-account
+
+Set `CLAUDE_MEM_DATA_DIR` per shell to isolate profiles. All hooks, CLI, and skills honor these env vars.
+
+## File Locations
+
+- **Source**: `src/`
+- **Built Plugin**: `plugin/`
+- **Installed Plugin**: `~/.claude/plugins/marketplaces/thedotmack/`
+- **Database**: `~/.claude-mem/claude-mem.db`
+- **Chroma**: `~/.claude-mem/chroma/`
+- **Logs**: `~/.claude-mem/logs/worker-YYYY-MM-DD.log`
 
 ## Requirements
 
-- **Bun** (all platforms - auto-installed if missing)
-- **uv** (all platforms - auto-installed if missing, provides Python for Chroma)
-- Node.js
+- **Bun** (auto-installed if missing)
+- **uv** (auto-installed if missing, provides Python for Chroma)
+- Node.js ≥ 20
 
 ## Documentation
 
 **Public Docs**: https://docs.claude-mem.ai (Mintlify)
-**Source**: `docs/public/` - MDX files, edit `docs.json` for navigation
+**Source**: `docs/public/` — MDX files, `docs.json` for navigation
 **Deploy**: Auto-deploys from GitHub on push to main
 
 ## Pro Features Architecture
 
-Claude-mem is designed with a clean separation between open-source core functionality and optional Pro features.
-
-**Open-Source Core** (this repository):
-
-- All local worker HTTP API endpoints (per-user port — see Architecture above) remain fully open and accessible
-- Pro features are headless - no proprietary UI elements in this codebase
-- Pro integration points are minimal: settings for license keys, tunnel provisioning logic
-- The architecture ensures Pro features extend rather than replace core functionality
-
-**Pro Features** (coming soon, external):
-
-- Enhanced UI (Memory Stream) connects to the same local worker endpoints as the open viewer
-- Additional features like advanced filtering, timeline scrubbing, and search tools
-- Access gated by license validation, not by modifying core endpoints
-- Users without Pro licenses continue using the full open-source viewer UI without limitation
-
-This architecture preserves the open-source nature of the project while enabling sustainable development through optional paid features.
+The open-source core exposes all local worker HTTP API endpoints unchanged. Pro features (external, coming soon) add enhanced UI and additional tools that connect to the same endpoints. Access is gated by license validation, not by modifying core endpoints.
 
 ## Important
 
-No need to edit the changelog ever, it's generated automatically.
+- Changelog is generated automatically — never edit it manually (`scripts/generate-changelog.js`).
+- Tests use Bun's built-in test runner (`bun test`), configured with `smol = true` in `bunfig.toml`.
+- The viewer (`src/ui/viewer/`) has its own `tsconfig.json` and is excluded from the root TypeScript project.
 
 ## Daily Maintenance
 
