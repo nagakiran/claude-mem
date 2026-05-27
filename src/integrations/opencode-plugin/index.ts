@@ -86,6 +86,7 @@ async function workerGetText(urlPath: string): Promise<string | null> {
 }
 
 const contentSessionIdsByOpenCodeSessionId = new Map<string, string>();
+const initializedSessions = new Set<string>();
 
 const MAX_SESSION_MAP_ENTRIES = 1000;
 
@@ -95,6 +96,7 @@ function getOrCreateContentSessionId(openCodeSessionId: string): string {
       const oldestKey = contentSessionIdsByOpenCodeSessionId.keys().next().value;
       if (oldestKey !== undefined) {
         contentSessionIdsByOpenCodeSessionId.delete(oldestKey);
+        initializedSessions.delete(oldestKey);
       } else {
         break;
       }
@@ -174,7 +176,8 @@ export const ClaudeMemPlugin = async (ctx: OpenCodePluginContext) => {
       });
     },
 
-    // Captures user prompt text so it's stored as an observation.
+    // On first message: lazily init the session with the real prompt text.
+    // On subsequent messages: store as an observation.
     "chat.message": async (
       input: { sessionID: string; messageID?: string },
       output: { message: unknown; parts: Array<{ type: string; text?: string }> },
@@ -186,6 +189,17 @@ export const ClaudeMemPlugin = async (ctx: OpenCodePluginContext) => {
       if (!textParts) return;
 
       const contentSessionId = getOrCreateContentSessionId(input.sessionID);
+
+      if (!initializedSessions.has(input.sessionID)) {
+        initializedSessions.add(input.sessionID);
+        workerPostFireAndForget("/api/sessions/init", {
+          contentSessionId,
+          project: projectName,
+          prompt: textParts.slice(0, MAX_TOOL_RESPONSE_LENGTH),
+        });
+        return;
+      }
+
       workerPostFireAndForget("/api/sessions/observations", {
         contentSessionId,
         tool_name: "user_prompt",
@@ -212,12 +226,9 @@ export const ClaudeMemPlugin = async (ctx: OpenCodePluginContext) => {
     event: async ({ event }: BusEventWrapper) => {
       switch (event.type) {
         case "session.created": {
-          const contentSessionId = getOrCreateContentSessionId(event.sessionID!);
-          workerPostFireAndForget("/api/sessions/init", {
-            contentSessionId,
-            project: projectName,
-            prompt: "",
-          });
+          // Pre-create the session ID mapping; actual init is deferred to the
+          // first chat.message so we always have the real prompt text.
+          getOrCreateContentSessionId(event.sessionID!);
           break;
         }
 
@@ -225,6 +236,7 @@ export const ClaudeMemPlugin = async (ctx: OpenCodePluginContext) => {
           if (event.sessionID) {
             void updateAgentsMd();
             contentSessionIdsByOpenCodeSessionId.delete(event.sessionID);
+            initializedSessions.delete(event.sessionID);
           }
           break;
         }
