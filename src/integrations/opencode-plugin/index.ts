@@ -1,4 +1,6 @@
-import { z } from "zod";
+import fs from "fs";
+import os from "os";
+import path from "path";
 
 interface OpenCodeProject {
   name?: string;
@@ -11,7 +13,7 @@ interface OpenCodePluginContext {
   directory: string;
   worktree: string;
   serverUrl: URL;
-  $: unknown; 
+  $: unknown;
 }
 
 interface ToolExecuteAfterInput {
@@ -27,47 +29,12 @@ interface ToolExecuteAfterOutput {
   metadata: Record<string, unknown>;
 }
 
-interface ToolDefinition {
-  description: string;
-  args: Record<string, unknown>;
-  execute: (args: Record<string, unknown>, context: unknown) => Promise<string>;
-}
-
-interface SessionCreatedEvent {
+interface BusEventWrapper {
   event: {
-    sessionID: string;
-    directory?: string;
-    project?: string;
-  };
-}
-
-interface MessageUpdatedEvent {
-  event: {
-    sessionID: string;
-    role: string;
-    content: string;
-  };
-}
-
-interface SessionCompactedEvent {
-  event: {
-    sessionID: string;
-    summary?: string;
-    messageCount?: number;
-  };
-}
-
-interface FileEditedEvent {
-  event: {
-    sessionID: string;
-    path: string;
-    diff?: string;
-  };
-}
-
-interface SessionDeletedEvent {
-  event: {
-    sessionID: string;
+    type: string;
+    sessionID?: string;
+    info?: Record<string, unknown>;
+    [key: string]: unknown;
   };
 }
 
@@ -102,18 +69,18 @@ function workerPostFireAndForget(
   });
 }
 
-async function workerGetText(path: string): Promise<string | null> {
+async function workerGetText(urlPath: string): Promise<string | null> {
   try {
-    const response = await fetch(`${WORKER_BASE_URL}${path}`, { headers: JSON_HEADERS });
+    const response = await fetch(`${WORKER_BASE_URL}${urlPath}`, { headers: JSON_HEADERS });
     if (!response.ok) {
-      console.warn(`[claude-mem] Worker GET ${path} returned ${response.status}`);
+      console.warn(`[claude-mem] Worker GET ${urlPath} returned ${response.status}`);
       return null;
     }
     return await response.text();
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     if (!message.includes("ECONNREFUSED")) {
-      console.warn(`[claude-mem] Worker GET ${path} failed: ${message}`);
+      console.warn(`[claude-mem] Worker GET ${urlPath} failed: ${message}`);
     }
     return null;
   }
@@ -146,39 +113,107 @@ export const ClaudeMemPlugin = async (ctx: OpenCodePluginContext) => {
 
   console.log(`[claude-mem] OpenCode plugin loading (project: ${projectName})`);
 
+  async function updateAgentsMd(): Promise<void> {
+    const context = await workerGetText(
+      `/api/context/inject?projects=${encodeURIComponent(projectName)}`,
+    );
+    if (!context) return;
+
+    const configDir =
+      process.env.OPENCODE_CONFIG_DIR ||
+      path.join(os.homedir(), ".config", "opencode");
+    const agentsMdPath = path.join(configDir, "AGENTS.md");
+
+    const OPEN_TAG = "<claude-mem-context>";
+    const CLOSE_TAG = "</claude-mem-context>";
+    const wrapped = `${OPEN_TAG}\n${context}\n${CLOSE_TAG}`;
+
+    try {
+      let existingContent: string;
+      if (fs.existsSync(agentsMdPath)) {
+        existingContent = fs.readFileSync(agentsMdPath, "utf-8");
+        const start = existingContent.indexOf(OPEN_TAG);
+        const end = existingContent.indexOf(CLOSE_TAG);
+        if (start !== -1 && end !== -1) {
+          existingContent =
+            existingContent.slice(0, start) +
+            wrapped +
+            existingContent.slice(end + CLOSE_TAG.length);
+        } else {
+          existingContent = existingContent.trimEnd() + "\n\n" + wrapped + "\n";
+        }
+      } else {
+        fs.mkdirSync(configDir, { recursive: true });
+        existingContent = `# Claude-Mem Memory Context\n\n${wrapped}\n`;
+      }
+      fs.writeFileSync(agentsMdPath, existingContent, "utf-8");
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[claude-mem] Failed to update AGENTS.md: ${message}`);
+    }
+  }
+
   return {
-    hooks: {
-      tool: {
-        execute: {
-          after: (
-            input: ToolExecuteAfterInput,
-            output: ToolExecuteAfterOutput,
-          ) => {
-            const contentSessionId = getOrCreateContentSessionId(input.sessionID);
+    // Captures every tool execution and sends it to the worker as an observation.
+    "tool.execute.after": async (
+      input: ToolExecuteAfterInput,
+      output: ToolExecuteAfterOutput,
+    ) => {
+      const contentSessionId = getOrCreateContentSessionId(input.sessionID);
 
-            let toolResponseText = output.output || "";
-            if (toolResponseText.length > MAX_TOOL_RESPONSE_LENGTH) {
-              toolResponseText = toolResponseText.slice(0, MAX_TOOL_RESPONSE_LENGTH);
-            }
+      let toolResponseText = output.output || "";
+      if (toolResponseText.length > MAX_TOOL_RESPONSE_LENGTH) {
+        toolResponseText = toolResponseText.slice(0, MAX_TOOL_RESPONSE_LENGTH);
+      }
 
-            workerPostFireAndForget("/api/sessions/observations", {
-              contentSessionId,
-              tool_name: input.tool,
-              tool_input: input.args || {},
-              tool_response: toolResponseText,
-              cwd: ctx.directory,
-            });
-          },
-        },
-      },
+      workerPostFireAndForget("/api/sessions/observations", {
+        contentSessionId,
+        tool_name: input.tool,
+        tool_input: input.args || {},
+        tool_response: toolResponseText,
+        cwd: ctx.directory,
+      });
     },
 
-    event: (eventName: string, payload: unknown) => {
-      switch (eventName) {
-        case "session.created": {
-          const { event } = payload as SessionCreatedEvent;
-          const contentSessionId = getOrCreateContentSessionId(event.sessionID);
+    // Captures user prompt text so it's stored as an observation.
+    "chat.message": async (
+      input: { sessionID: string; messageID?: string },
+      output: { message: unknown; parts: Array<{ type: string; text?: string }> },
+    ) => {
+      const textParts = (output.parts || [])
+        .filter((p) => p.type === "text")
+        .map((p) => p.text || "")
+        .join("");
+      if (!textParts) return;
 
+      const contentSessionId = getOrCreateContentSessionId(input.sessionID);
+      workerPostFireAndForget("/api/sessions/observations", {
+        contentSessionId,
+        tool_name: "user_prompt",
+        tool_input: {},
+        tool_response: textParts.slice(0, MAX_TOOL_RESPONSE_LENGTH),
+        cwd: ctx.directory,
+      });
+    },
+
+    // Triggered when OpenCode compacts/summarizes a session.
+    "experimental.session.compacting": async (
+      input: { sessionID: string },
+      _output: { context: string[]; prompt?: string },
+    ) => {
+      const contentSessionId = getOrCreateContentSessionId(input.sessionID);
+      workerPostFireAndForget("/api/sessions/summarize", {
+        contentSessionId,
+        last_assistant_message: "",
+      });
+      void updateAgentsMd();
+    },
+
+    // Bus event subscription for session lifecycle and file edits.
+    event: async ({ event }: BusEventWrapper) => {
+      switch (event.type) {
+        case "session.created": {
+          const contentSessionId = getOrCreateContentSessionId(event.sessionID!);
           workerPostFireAndForget("/api/sessions/init", {
             contentSessionId,
             project: projectName,
@@ -187,58 +222,11 @@ export const ClaudeMemPlugin = async (ctx: OpenCodePluginContext) => {
           break;
         }
 
-        case "message.updated": {
-          const { event } = payload as MessageUpdatedEvent;
-
-          if (event.role !== "assistant") break;
-
-          const contentSessionId = getOrCreateContentSessionId(event.sessionID);
-
-          let messageText = event.content || "";
-          if (messageText.length > MAX_TOOL_RESPONSE_LENGTH) {
-            messageText = messageText.slice(0, MAX_TOOL_RESPONSE_LENGTH);
-          }
-
-          workerPostFireAndForget("/api/sessions/observations", {
-            contentSessionId,
-            tool_name: "assistant_message",
-            tool_input: {},
-            tool_response: messageText,
-            cwd: ctx.directory,
-          });
-          break;
-        }
-
-        case "session.compacted": {
-          const { event } = payload as SessionCompactedEvent;
-          const contentSessionId = getOrCreateContentSessionId(event.sessionID);
-
-          workerPostFireAndForget("/api/sessions/summarize", {
-            contentSessionId,
-            last_assistant_message: event.summary || "",
-          });
-          break;
-        }
-
-        case "file.edited": {
-          const { event } = payload as FileEditedEvent;
-          const contentSessionId = getOrCreateContentSessionId(event.sessionID);
-
-          workerPostFireAndForget("/api/sessions/observations", {
-            contentSessionId,
-            tool_name: "file_edit",
-            tool_input: { path: event.path },
-            tool_response: event.diff
-              ? event.diff.slice(0, MAX_TOOL_RESPONSE_LENGTH)
-              : `File edited: ${event.path}`,
-            cwd: ctx.directory,
-          });
-          break;
-        }
-
         case "session.deleted": {
-          const { event } = payload as SessionDeletedEvent;
-          contentSessionIdsByOpenCodeSessionId.delete(event.sessionID);
+          if (event.sessionID) {
+            void updateAgentsMd();
+            contentSessionIdsByOpenCodeSessionId.delete(event.sessionID);
+          }
           break;
         }
       }
@@ -249,11 +237,12 @@ export const ClaudeMemPlugin = async (ctx: OpenCodePluginContext) => {
         description:
           "Search claude-mem memory database for past observations, sessions, and context",
         args: {
-          query: z.string().describe("Search query for memory observations"),
+          query: {
+            type: "string",
+            description: "Search query for memory observations",
+          },
         },
-        async execute(
-          args: Record<string, unknown>,
-        ): Promise<string> {
+        async execute(args: Record<string, unknown>): Promise<string> {
           const query = String(args.query || "");
           if (!query) {
             return "Please provide a search query.";
@@ -267,29 +256,24 @@ export const ClaudeMemPlugin = async (ctx: OpenCodePluginContext) => {
             return "claude-mem worker is not running. Start it with: npx claude-mem start";
           }
 
-          let data: any;
+          let data: { content?: Array<{ type: string; text: string }> };
           try {
             data = JSON.parse(text);
           } catch (error: unknown) {
-            console.warn('[claude-mem] Failed to parse search results:', error instanceof Error ? error.message : String(error));
+            console.warn(
+              "[claude-mem] Failed to parse search results:",
+              error instanceof Error ? error.message : String(error),
+            );
             return "Failed to parse search results.";
           }
 
-          const items = Array.isArray(data.items) ? data.items : [];
-          if (items.length === 0) {
+          const resultText = data.content?.[0]?.text;
+          if (!resultText) {
             return `No results found for "${query}".`;
           }
-
-          return items
-            .slice(0, 10)
-            .map((item: Record<string, unknown>, index: number) => {
-              const title = String(item.title || item.subtitle || "Untitled");
-              const project = item.project ? ` [${String(item.project)}]` : "";
-              return `${index + 1}. ${title}${project}`;
-            })
-            .join("\n");
+          return resultText;
         },
-      } satisfies ToolDefinition,
+      },
     },
   };
 };
