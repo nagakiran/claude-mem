@@ -44,8 +44,7 @@ function resolveWorkerPort(): string {
   if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535) {
     return String(parsed);
   }
-  const uid = typeof process.getuid === "function" ? process.getuid() : 77;
-  return String(37700 + (uid % 100));
+  return "37777";
 }
 
 const WORKER_BASE_URL = `http://127.0.0.1:${resolveWorkerPort()}`;

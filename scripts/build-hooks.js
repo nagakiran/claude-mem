@@ -371,7 +371,7 @@ async function buildHooks() {
         target: 'node18',
         format: 'esm',
         outfile: `${opencodeOutDir}/index.js`,
-        minify: true,
+        minify: false,
         logLevel: 'error',
         external: [
           'fs', 'fs/promises', 'path', 'os', 'child_process', 'url',
