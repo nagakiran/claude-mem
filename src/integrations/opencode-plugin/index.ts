@@ -110,7 +110,8 @@ function getOrCreateContentSessionId(openCodeSessionId: string): string {
 }
 
 export const ClaudeMemPlugin = async (ctx: OpenCodePluginContext) => {
-  const projectName = ctx.project?.name || "opencode";
+  const projectName = ctx.project?.name ||
+    (ctx.directory ? path.basename(ctx.directory) : "opencode");
 
   console.log(`[claude-mem] OpenCode plugin loading (project: ${projectName})`);
 
@@ -196,6 +197,7 @@ export const ClaudeMemPlugin = async (ctx: OpenCodePluginContext) => {
           contentSessionId,
           project: projectName,
           prompt: textParts.slice(0, MAX_TOOL_RESPONSE_LENGTH),
+          platformSource: "opencode",
         });
         return;
       }
@@ -218,6 +220,7 @@ export const ClaudeMemPlugin = async (ctx: OpenCodePluginContext) => {
       workerPostFireAndForget("/api/sessions/summarize", {
         contentSessionId,
         last_assistant_message: "",
+        platformSource: "opencode",
       });
       void updateAgentsMd();
     },
@@ -234,6 +237,15 @@ export const ClaudeMemPlugin = async (ctx: OpenCodePluginContext) => {
 
         case "session.deleted": {
           if (event.sessionID) {
+            const contentSessionId =
+              contentSessionIdsByOpenCodeSessionId.get(event.sessionID);
+            if (contentSessionId && initializedSessions.has(event.sessionID)) {
+              workerPostFireAndForget("/api/sessions/summarize", {
+                contentSessionId,
+                last_assistant_message: "",
+                platformSource: "opencode",
+              });
+            }
             void updateAgentsMd();
             contentSessionIdsByOpenCodeSessionId.delete(event.sessionID);
             initializedSessions.delete(event.sessionID);
