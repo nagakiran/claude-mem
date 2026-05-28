@@ -87,6 +87,8 @@ async function workerGetText(urlPath: string): Promise<string | null> {
 
 const contentSessionIdsByOpenCodeSessionId = new Map<string, string>();
 const initializedSessions = new Set<string>();
+const SUMMARIZE_IDLE_MS = 2 * 60 * 1000;
+const sessionTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 const MAX_SESSION_MAP_ENTRIES = 1000;
 
@@ -155,6 +157,24 @@ export const ClaudeMemPlugin = async (ctx: OpenCodePluginContext) => {
     }
   }
 
+  function scheduleSessionSummarize(openCodeSessionId: string): void {
+    const existing = sessionTimers.get(openCodeSessionId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      sessionTimers.delete(openCodeSessionId);
+      const contentSessionId = contentSessionIdsByOpenCodeSessionId.get(openCodeSessionId);
+      if (contentSessionId && initializedSessions.has(openCodeSessionId)) {
+        workerPostFireAndForget("/api/sessions/summarize", {
+          contentSessionId,
+          last_assistant_message: "",
+          platformSource: "opencode",
+        });
+      }
+    }, SUMMARIZE_IDLE_MS);
+    timer.unref();
+    sessionTimers.set(openCodeSessionId, timer);
+  }
+
   return {
     // Captures every tool execution and sends it to the worker as an observation.
     "tool.execute.after": async (
@@ -175,6 +195,7 @@ export const ClaudeMemPlugin = async (ctx: OpenCodePluginContext) => {
         tool_response: toolResponseText,
         cwd: ctx.directory,
       });
+      scheduleSessionSummarize(input.sessionID);
     },
 
     // On first message: lazily init the session with the real prompt text.
@@ -209,6 +230,7 @@ export const ClaudeMemPlugin = async (ctx: OpenCodePluginContext) => {
         tool_response: textParts.slice(0, MAX_TOOL_RESPONSE_LENGTH),
         cwd: ctx.directory,
       });
+      scheduleSessionSummarize(input.sessionID);
     },
 
     // Triggered when OpenCode compacts/summarizes a session.
@@ -216,6 +238,8 @@ export const ClaudeMemPlugin = async (ctx: OpenCodePluginContext) => {
       input: { sessionID: string },
       _output: { context: string[]; prompt?: string },
     ) => {
+      const existing = sessionTimers.get(input.sessionID);
+      if (existing) { clearTimeout(existing); sessionTimers.delete(input.sessionID); }
       const contentSessionId = getOrCreateContentSessionId(input.sessionID);
       workerPostFireAndForget("/api/sessions/summarize", {
         contentSessionId,
@@ -237,6 +261,8 @@ export const ClaudeMemPlugin = async (ctx: OpenCodePluginContext) => {
 
         case "session.deleted": {
           if (event.sessionID) {
+            const existingTimer = sessionTimers.get(event.sessionID);
+            if (existingTimer) { clearTimeout(existingTimer); sessionTimers.delete(event.sessionID); }
             const contentSessionId =
               contentSessionIdsByOpenCodeSessionId.get(event.sessionID);
             if (contentSessionId && initializedSessions.has(event.sessionID)) {

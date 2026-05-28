@@ -2,6 +2,7 @@
 
 import { build } from 'esbuild';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -381,6 +382,13 @@ async function buildHooks() {
 
       const opencodeStats = fs.statSync(`${opencodeOutDir}/index.js`);
       console.log(`✓ opencode plugin built (${(opencodeStats.size / 1024).toFixed(2)} KB)`);
+
+      const opencodePluginDest = path.join(os.homedir(), '.config', 'opencode', 'plugins', 'claude-mem.js');
+      if (fs.existsSync(path.dirname(opencodePluginDest))) {
+        fs.mkdirSync(path.dirname(opencodePluginDest), { recursive: true });
+        fs.copyFileSync(`${opencodeOutDir}/index.js`, opencodePluginDest);
+        console.log(`✓ opencode plugin deployed → ${opencodePluginDest}`);
+      }
     }
 
     console.log('\n📋 Copying onboarding explainer to plugin tree...');
