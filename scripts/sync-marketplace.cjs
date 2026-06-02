@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const { execSync } = require('child_process');
-const { existsSync, readFileSync } = require('fs');
+const { existsSync, readFileSync, readdirSync } = require('fs');
 const path = require('path');
 const os = require('os');
 
@@ -47,6 +47,19 @@ function getGitignoreExcludes(basePath) {
     )
     .map(pattern => `--exclude=${JSON.stringify(pattern)}`)
     .join(' ');
+}
+
+function findAdditionalInstallLocations() {
+  const configDir = path.join(os.homedir(), '.config');
+  if (!existsSync(configDir)) return [];
+  try {
+    return readdirSync(configDir)
+      .filter(entry => entry.startsWith('claude'))
+      .map(entry => path.join(configDir, entry, 'plugins', 'marketplaces', 'thedotmack'))
+      .filter(dir => existsSync(dir));
+  } catch {
+    return [];
+  }
 }
 
 const branch = getCurrentBranch();
@@ -145,6 +158,17 @@ try {
     'cd ~/.claude/plugins/marketplaces/thedotmack/ && bun install',
     { stdio: 'inherit' }
   );
+
+  const additionalLocations = findAdditionalInstallLocations();
+  for (const dest of additionalLocations) {
+    console.log(`Syncing to additional install: ${dest}...`);
+    execSync(
+      `rsync -av --delete --exclude=.git --exclude=bun.lock --exclude=package-lock.json --exclude=scripts/package.json --exclude=scripts/node_modules ${gitignoreExcludes} ./ "${dest}/"`,
+      { stdio: 'inherit' }
+    );
+    console.log(`Running bun install in ${dest}...`);
+    execSync('bun install', { cwd: dest, stdio: 'inherit' });
+  }
 
   const version = getPluginVersion();
   const CACHE_VERSION_PATH = path.join(CACHE_BASE_PATH, version);
