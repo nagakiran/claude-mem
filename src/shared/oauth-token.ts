@@ -19,7 +19,6 @@ import { logger } from '../utils/logger.js';
 
 const execFileAsync = promisify(execFile);
 
-const KEYCHAIN_SERVICE_NAME = 'Claude Code-credentials';
 const READ_TIMEOUT_MS = 5000;
 
 // Grace window: even if expiresAt is in the past by less than this, allow the
@@ -77,16 +76,17 @@ function isExpired(expiresAtMs: number | undefined): boolean {
  *   {"claudeAiOauth":{"accessToken":"...","refreshToken":"...","expiresAt":<ms>}}
  */
 async function readMacOsKeychain(): Promise<OAuthTokenResult> {
+  const keychainService = process.env.CLAUDE_MEM_KEYCHAIN_SERVICE ?? 'Claude Code-credentials';
   const account = userInfo().username;
   try {
     const { stdout } = await execFileAsync(
       'security',
-      ['find-generic-password', '-s', KEYCHAIN_SERVICE_NAME, '-a', account, '-w'],
+      ['find-generic-password', '-s', keychainService, '-a', account, '-w'],
       { timeout: READ_TIMEOUT_MS, windowsHide: true },
     );
     const raw = stdout.trim();
     if (!raw) {
-      return { kind: 'absent', reason: 'macOS keychain returned empty value for "Claude Code-credentials"' };
+      return { kind: 'absent', reason: `macOS keychain returned empty value for "${keychainService}"` };
     }
     return parseKeychainPayload(raw);
   } catch (error) {
@@ -94,7 +94,7 @@ async function readMacOsKeychain(): Promise<OAuthTokenResult> {
     // `security` exits non-zero when the entry doesn't exist — fail-fast as absent.
     return {
       kind: 'absent',
-      reason: `macOS keychain lookup failed for service "${KEYCHAIN_SERVICE_NAME}" (account=${account}): ${err.message ?? String(err)}`,
+      reason: `macOS keychain lookup failed for service "${keychainService}" (account=${account}): ${err.message ?? String(err)}`,
     };
   }
 }
@@ -157,7 +157,7 @@ async function readWindowsCredentialManager(): Promise<OAuthTokenResult> {
     );
     const raw = stdout.trim();
     if (!raw) {
-      return { kind: 'absent', reason: 'Windows Credential Manager has no entry for "Claude Code-credentials"' };
+      return { kind: 'absent', reason: `Windows Credential Manager has no entry for "${process.env.CLAUDE_MEM_KEYCHAIN_SERVICE ?? 'Claude Code-credentials'}"` };
     }
     return parseKeychainPayload(raw);
   } catch (error) {
@@ -175,16 +175,17 @@ async function readWindowsCredentialManager(): Promise<OAuthTokenResult> {
  * the account attribute set to the OS username.
  */
 async function readLinuxLibsecret(): Promise<OAuthTokenResult> {
+  const keychainService = process.env.CLAUDE_MEM_KEYCHAIN_SERVICE ?? 'Claude Code-credentials';
   const account = userInfo().username;
   try {
     const { stdout } = await execFileAsync(
       'secret-tool',
-      ['lookup', 'service', KEYCHAIN_SERVICE_NAME, 'account', account],
+      ['lookup', 'service', keychainService, 'account', account],
       { timeout: READ_TIMEOUT_MS, windowsHide: true },
     );
     const raw = stdout.trim();
     if (!raw) {
-      return { kind: 'absent', reason: 'Linux libsecret returned empty value for "Claude Code-credentials"' };
+      return { kind: 'absent', reason: `Linux libsecret returned empty value for "${keychainService}"` };
     }
     return parseKeychainPayload(raw);
   } catch (error) {

@@ -312,6 +312,14 @@ export class WorkerService implements WorkerRef {
 
       const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
 
+      // Export settings to process.env so runtime code (e.g. oauth-token.ts) can
+      // read them via process.env. Only fills gaps — explicit shell env vars win.
+      for (const key of Object.keys(settings) as Array<keyof typeof settings>) {
+        if (process.env[key] === undefined) {
+          process.env[key] = settings[key];
+        }
+      }
+
       const modeId = settings.CLAUDE_MEM_MODE;
       ModeManager.getInstance().loadMode(modeId);
       logger.info('SYSTEM', `Mode loaded: ${modeId}`);
