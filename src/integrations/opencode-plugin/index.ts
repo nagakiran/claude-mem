@@ -220,6 +220,7 @@ export const ClaudeMemPlugin = async (ctx: OpenCodePluginContext) => {
           prompt: textParts.slice(0, MAX_TOOL_RESPONSE_LENGTH),
           platformSource: "opencode",
         });
+        void updateAgentsMd();
         return;
       }
 
